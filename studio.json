@@ -1,0 +1,9 @@
+{
+  "base_iso": "base.iso",
+  "name": "Sirco-Cr0n",
+  "project_version": 1,
+  "rootfs_squashfs": null,
+  "squashfs_block_size": null,
+  "squashfs_compression": null,
+  "volume_id": "Ubuntu-Server 25.10 amd64"
+}
