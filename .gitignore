@@ -1,0 +1,8 @@
+*.img
+*.iso
+*.md5
+*/split
+/split
+split/
+.codex
+based-on/
