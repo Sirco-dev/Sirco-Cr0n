@@ -2,8 +2,8 @@
   "base_iso": "base.iso",
   "name": "Sirco-Cr0n",
   "project_version": 1,
-  "rootfs_squashfs": null,
-  "squashfs_block_size": null,
-  "squashfs_compression": null,
+  "rootfs_squashfs": "casper/ubuntu-server-minimal.squashfs",
+  "squashfs_block_size": 131072,
+  "squashfs_compression": "xz",
   "volume_id": "Ubuntu-Server 25.10 amd64"
 }

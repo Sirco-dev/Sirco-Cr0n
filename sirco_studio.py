@@ -24,7 +24,7 @@ DEFAULT_COMPRESSION = "gzip"
 DEFAULT_BLOCK_SIZE = 131072
 
 CompressionKey = Literal["xz", "gzip", "lz4"]
-WorkflowStepKey = Literal["overview", "project", "unpack", "shell", "details", "compression", "build"]
+WorkflowStepKey = Literal["overview", "project", "unpack", "shell", "details", "yaml", "compression", "build"]
 
 
 class CompressionChoice(TypedDict):
@@ -92,6 +92,7 @@ WORKFLOW_STEPS: list[tuple[WorkflowStepKey, str, str]] = [
     ("unpack", "Unpack ISO", "Extract the ISO tree and editable rootfs."),
     ("shell", "Edit Shell", "Open the chroot in a real terminal window."),
     ("details", "ISO Details", "Volume label, boot config, and manifest files."),
+    ("yaml", "Ubuntu Scripts", "Configure custom scripts and cloud-init YAML."),
     ("compression", "Compression", "Choose how the rebuilt squashfs trades size for speed."),
     ("build", "Build ISO", "Repack the rootfs, refresh metadata, and make a bootable ISO."),
 ]
@@ -404,7 +405,7 @@ def maybe_clear(path: Path, force: bool) -> None:
         return
     if not force:
         die(f"{path} already exists, rerun with --force to replace it")
-    shutil.rmtree(path)
+    shutil.rmtree(path, ignore_errors=True)
 
 
 def detect_rootfs_squashfs(iso_dir: Path) -> str:
@@ -686,31 +687,62 @@ def cmd_unpack(args: argparse.Namespace) -> None:
     paths["rootfs"].mkdir(parents=True, exist_ok=True)
 
     info("Extracting ISO tree...")
-    run(
-        [
-            "xorriso",
-            "-osirrox",
-            "on",
-            "-indev",
-            str(paths["base_iso"]),
-            "-extract",
-            "/",
-            str(paths["iso"]),
-        ]
-    )
+    try:
+        # Try extraction with robust error handling
+        result = run(
+            [
+                "xorriso",
+                "-indev",
+                str(paths["base_iso"]),
+                "-osirrox",
+                "on",
+                "-extract",
+                "/",
+                str(paths["iso"]),
+            ],
+            capture=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            info(f"Extraction warnings (may be normal): {result.stderr}")
+    except Exception as exc:
+        die(f"ISO extraction failed: {exc}")
+
+    # Verify extraction worked
+    iso_files = list(paths["iso"].glob("*"))
+    if not iso_files:
+        die("ISO extraction produced no files. Check the base ISO file.")
 
     rootfs_relpath = detect_rootfs_squashfs(paths["iso"])
     squashfs_path = paths["iso"] / rootfs_relpath
+    
+    if not squashfs_path.exists():
+        die(f"Squashfs not found at: {squashfs_path}")
+    
     details = parse_squashfs_details(squashfs_path)
 
     info(f"Unpacking editable rootfs from {rootfs_relpath}...")
-    run(["unsquashfs", "-f", "-d", str(paths["rootfs"]), str(squashfs_path)])
+    try:
+        result = run(
+            ["unsquashfs", "-f", "-d", str(paths["rootfs"]), str(squashfs_path)],
+            capture=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            die(f"Unsquashfs failed: {result.stderr}")
+    except Exception as exc:
+        die(f"Rootfs unpacking failed: {exc}")
+
+    # Verify extraction
+    rootfs_files = list(paths["rootfs"].glob("*"))
+    if not rootfs_files:
+        die("Rootfs unpacking produced no files.")
 
     project["rootfs_squashfs"] = rootfs_relpath
     project["squashfs_compression"] = details["compression"]
     project["squashfs_block_size"] = details["block_size"]
     save_project(project)
-    info("Project unpacked.")
+    info("✓ Project unpacked successfully.")
     info(f"Open the editing shell with: python3 {Path(__file__).name} shell {paths['project']}")
 
 
@@ -920,6 +952,11 @@ def launch_gui(initial_project: Path | None = None) -> int:
             self.root.minsize(1180, 760)
             self.root.configure(bg=BG)
 
+            # Enable fullscreen support
+            self.is_fullscreen = False
+            self.root.bind("<F11>", self.toggle_fullscreen)
+            self.root.bind("<F12>", self.maximize_window)
+
             self.page_frames: dict[WorkflowStepKey, tk.Frame] = {}
             self.sidebar_buttons: dict[WorkflowStepKey, tk.Button] = {}
             self.action_buttons: list[tk.Button] = []
@@ -977,15 +1014,104 @@ def launch_gui(initial_project: Path | None = None) -> int:
             shell = tk.Frame(self.root, bg=BG)
             shell.pack(fill="both", expand=True)
 
-            sidebar = tk.Frame(shell, bg=SIDEBAR, width=280)
-            sidebar.pack(side="left", fill="y")
-            sidebar.pack_propagate(False)
+            # Left: Sidebar with scrollbar
+            sidebar_frame_container = tk.Frame(shell, bg=SIDEBAR, width=280)
+            sidebar_frame_container.pack(side="left", fill="y", padx=0, pady=0)
+            sidebar_frame_container.pack_propagate(False)
 
+            # Main scrollable area
             main = tk.Frame(shell, bg=BG)
             main.pack(side="left", fill="both", expand=True)
 
-            self.build_sidebar(sidebar)
+            self.build_scrollable_sidebar(sidebar_frame_container)
             self.build_main(main)
+
+        def build_scrollable_sidebar(self, parent: tk.Frame) -> None:
+            """Build a properly scrollable sidebar using Canvas + Frame"""
+            # Create scrollbar first
+            scrollbar = tk.Scrollbar(parent, orient="vertical")  # type: ignore[misc]
+            
+            # Create canvas with proper dimensions
+            canvas = tk.Canvas(
+                parent,
+                bg=SIDEBAR,
+                highlightthickness=0,
+                width=280,
+                yscrollcommand=scrollbar.set,
+            )
+            scrollbar.config(command=canvas.yview)  # type: ignore[arg-type]
+
+            # Create frame that will hold sidebar content
+            scrollable_frame = tk.Frame(canvas, bg=SIDEBAR)
+
+            # Create window in canvas - don't fix width, let it be content's natural width
+            canvas_window = canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+
+            # Configure canvas to scroll with frame - make it more robust
+            def on_frame_configure(event: tk.Event) -> None:
+                canvas.configure(scrollregion=canvas.bbox("all"))
+                # Make the frame fill the canvas width
+                canvas_width = canvas.winfo_width()
+                if canvas_width > 1:
+                    canvas.itemconfig(canvas_window, width=canvas_width)
+
+            scrollable_frame.bind("<Configure>", on_frame_configure)
+
+            # Pack scrollbar first (on right), then canvas
+            scrollbar.pack(side="right", fill="y")
+            canvas.pack(side="left", fill="both", expand=True)
+
+            # Enable mouse wheel scrolling for canvas
+            def _on_canvas_scroll(event: tk.Event) -> str:
+                delta = -1 if event.delta > 0 else 1
+                canvas.yview_scroll(delta, "units")
+                return "break"
+
+            # Bind mouse wheel to both canvas and its contents
+            canvas.bind("<MouseWheel>", _on_canvas_scroll)
+            canvas.bind("<Button-4>", lambda e: canvas.yview_scroll(-1, "units"))
+            canvas.bind("<Button-5>", lambda e: canvas.yview_scroll(1, "units"))
+            
+            # Also bind to scrollbar so it scrolls when hovering
+            scrollbar.bind("<MouseWheel>", _on_canvas_scroll)
+            scrollbar.bind("<Button-4>", lambda e: canvas.yview_scroll(-1, "units"))
+            scrollbar.bind("<Button-5>", lambda e: canvas.yview_scroll(1, "units"))
+            
+            # Recursively bind to all child widgets in scrollable_frame
+            def bind_all_widgets(widget: Any) -> None:  # type: ignore[type-arg,arg-type]
+                if hasattr(widget, 'bind'):
+                    widget.bind("<MouseWheel>", _on_canvas_scroll, add="+")
+                    widget.bind("<Button-4>", lambda e: canvas.yview_scroll(-1, "units"), add="+")
+                    widget.bind("<Button-5>", lambda e: canvas.yview_scroll(1, "units"), add="+")
+                if hasattr(widget, 'winfo_children'):
+                    for child in widget.winfo_children():
+                        bind_all_widgets(child)  # type: ignore[arg-type]
+            
+            # Build sidebar content first
+            self.build_sidebar(scrollable_frame)
+            
+            # Then bind all the widgets
+            bind_all_widgets(scrollable_frame)
+
+        def toggle_fullscreen(self, event: tk.Event | None = None) -> str:
+            self.is_fullscreen = not self.is_fullscreen
+            self.root.attributes("-fullscreen", bool(self.is_fullscreen))  # type: ignore[attr-defined]
+            return "break"
+
+        def maximize_window(self, event: tk.Event | None = None) -> str:
+            # Try to maximize; fall back to manual geometry on Linux
+            try:
+                if self.root.state() == "normal":
+                    self.root.state("zoomed")
+                else:
+                    self.root.state("normal")
+            except tk.TclError:
+                # Linux fallback: manually set window to screen size
+                self.root.update_idletasks()
+                screen_width = self.root.winfo_screenwidth()
+                screen_height = self.root.winfo_screenheight()
+                self.root.geometry(f"{screen_width}x{screen_height}+0+0")
+            return "break"
 
         def build_sidebar(self, parent: tk.Frame) -> None:
             brand = tk.Frame(parent, bg=SIDEBAR)
@@ -1045,7 +1171,7 @@ def launch_gui(initial_project: Path | None = None) -> int:
                 self.sidebar_buttons[key] = button
 
             status_card = tk.Frame(parent, bg=SIDEBAR_MUTED, highlightthickness=1, highlightbackground="#365867")
-            status_card.pack(side="bottom", fill="x", padx=18, pady=18)
+            status_card.pack(fill="x", padx=18, pady=18)
 
             tk.Label(
                 status_card,
@@ -1145,25 +1271,75 @@ def launch_gui(initial_project: Path | None = None) -> int:
                 font=self.fonts["mono"],
                 padx=14,
                 pady=12,
-                yscrollcommand=lambda f, l: None,  # Enable scrollbar
             )
             self.log_widget.pack(fill="both", expand=True, padx=18, pady=(0, 16))
             self.log_widget.insert("end", "Sirco Studio ready.\n")
             self.log_widget.configure(state="disabled")
+
+            # Add mouse wheel scrolling for log widget
+            if self.log_widget:
+                self.log_widget.bind("<MouseWheel>", lambda e: self._scroll_widget(self.log_widget, e))
+                self.log_widget.bind("<Button-4>", lambda e: self._scroll_widget_down(self.log_widget))
+                self.log_widget.bind("<Button-5>", lambda e: self._scroll_widget_up(self.log_widget))
 
             self.build_overview_page(content)
             self.build_project_page(content)
             self.build_unpack_page(content)
             self.build_shell_page(content)
             self.build_details_page(content)
+            self.build_yaml_page(content)
             self.build_compression_page(content)
             self.build_build_page(content)
-            self.show_page(self.current_page)
+            self.show_page(cast(WorkflowStepKey, self.current_page))
 
         def make_page(self, key: WorkflowStepKey) -> tk.Frame:
-            frame = tk.Frame(self.content, bg=BG)
-            frame.place(relx=0, rely=0, relwidth=1, relheight=1)
-            self.page_frames[key] = frame
+            # Create a container frame that will use place layout
+            container = tk.Frame(self.content, bg=BG)
+            container.place(relx=0, rely=0, relwidth=1, relheight=1)
+            
+            # Create scrollbar
+            scrollbar = tk.Scrollbar(container, orient="vertical")
+            scrollbar.pack(side="right", fill="y")
+            
+            # Create canvas for scrolling
+            canvas = tk.Canvas(
+                container,
+                bg=BG,
+                highlightthickness=0,
+                yscrollcommand=scrollbar.set,
+            )
+            canvas.pack(side="left", fill="both", expand=True)
+            scrollbar.config(command=canvas.yview)  # type: ignore[arg-type]
+            
+            # Create frame inside canvas for actual content
+            frame = tk.Frame(canvas, bg=BG)
+            
+            # Configure canvas
+            canvas_window = canvas.create_window((0, 0), window=frame, anchor="nw")
+            
+            def on_frame_configure(event: tk.Event) -> None:
+                canvas.configure(scrollregion=canvas.bbox("all"))
+                # Make frame fill canvas width
+                canvas_width = canvas.winfo_width()
+                if canvas_width > 1:
+                    canvas.itemconfig(canvas_window, width=canvas_width)
+            
+            frame.bind("<Configure>", on_frame_configure)
+            
+            # Enable mouse wheel scrolling
+            def _on_scroll(event: tk.Event) -> str:
+                delta = -1 if event.delta > 0 else 1
+                canvas.yview_scroll(delta, "units")
+                return "break"
+            
+            canvas.bind("<MouseWheel>", _on_scroll)
+            canvas.bind("<Button-4>", lambda e: canvas.yview_scroll(-1, "units"))
+            canvas.bind("<Button-5>", lambda e: canvas.yview_scroll(1, "units"))
+            scrollbar.bind("<MouseWheel>", _on_scroll)
+            scrollbar.bind("<Button-4>", lambda e: canvas.yview_scroll(-1, "units"))
+            scrollbar.bind("<Button-5>", lambda e: canvas.yview_scroll(1, "units"))
+            
+            self.page_frames[key] = container
             return frame
 
         def make_card(self, parent: tk.Widget, *, alt: bool = False) -> tk.Frame:
@@ -1421,12 +1597,22 @@ def launch_gui(initial_project: Path | None = None) -> int:
                 anchor="w",
             ).pack(fill="x", padx=20, pady=(0, 14))
 
+            buttons = tk.Frame(card, bg=PANEL)
+            buttons.pack(fill="x", padx=20, pady=(0, 18))
+            
             self.make_button(
-                card,
+                buttons,
                 text="Unpack ISO",
                 command=self.handle_unpack_project,
                 primary=True,
-            ).pack(anchor="w", padx=20, pady=(0, 18))
+            ).pack(side="left", padx=(0, 10))
+            
+            self.make_button(
+                buttons,
+                text="Force Unpack",
+                command=self.handle_unpack_project_force,
+                danger=False,
+            ).pack(side="left")
 
             summary = self.make_card(page, alt=True)
             summary.pack(fill="x", pady=(16, 0))
@@ -1491,6 +1677,83 @@ def launch_gui(initial_project: Path | None = None) -> int:
                 command=self.handle_open_shell,
                 primary=True,
             ).pack(anchor="w", padx=20, pady=(0, 18))
+
+        def build_yaml_page(self, parent: tk.Frame) -> None:
+            page = self.make_page("yaml")
+
+            intro = self.make_card(page)
+            intro.pack(fill="x")
+            tk.Label(
+                intro,
+                text="Ubuntu custom scripts & cloud-init YAML",
+                bg=PANEL,
+                fg=TEXT,
+                font=self.fonts["heading"],
+                anchor="w",
+            ).pack(fill="x", padx=20, pady=(18, 6))
+            tk.Label(
+                intro,
+                text=(
+                    "Add custom shell scripts, cloud-init user-data YAML, or other Ubuntu-specific configuration. "
+                    "These get embedded in the ISO and run on first boot or during system initialization."
+                ),
+                bg=PANEL,
+                fg=MUTED,
+                font=self.fonts["body"],
+                justify="left",
+                wraplength=900,
+                anchor="w",
+            ).pack(fill="x", padx=20, pady=(0, 14))
+
+            info_card = self.make_card(page, alt=True)
+            info_card.pack(fill="x", pady=(16, 0))
+            tk.Label(
+                info_card,
+                text="Tip",
+                bg=PANEL_ALT,
+                fg=TEXT,
+                font=self.fonts["subheading"],
+                anchor="w",
+            ).pack(fill="x", padx=20, pady=(18, 8))
+            tk.Label(
+                info_card,
+                text=(
+                    "Edit files directly in the rootfs using the Edit Shell step. Common locations:\n"
+                    "• /etc/cloud/cloud.cfg.d/ — cloud-init configuration\n"
+                    "• /usr/local/bin/ — custom scripts\n"
+                    "• /etc/systemd/system/ — systemd services"
+                ),
+                bg=PANEL_ALT,
+                fg=MUTED,
+                font=self.fonts["small"],
+                justify="left",
+                wraplength=900,
+                anchor="w",
+            ).pack(fill="x", padx=20, pady=(0, 18))
+
+            actions = self.make_card(page)
+            actions.pack(fill="x", pady=(16, 0))
+            tk.Label(
+                actions,
+                text="What to do next",
+                bg=PANEL,
+                fg=TEXT,
+                font=self.fonts["subheading"],
+                anchor="w",
+            ).pack(fill="x", padx=20, pady=(18, 8))
+            tk.Label(
+                actions,
+                text=(
+                    "Go back to Edit Shell and modify /etc/cloud/cloud.cfg.d/, /usr/local/bin/, or other files as needed. "
+                    "Then come back here and continue to the Compression step."
+                ),
+                bg=PANEL,
+                fg=MUTED,
+                font=self.fonts["body"],
+                justify="left",
+                wraplength=900,
+                anchor="w",
+            ).pack(fill="x", padx=20, pady=(0, 18))
 
         def build_compression_page(self, parent: tk.Frame) -> None:
             page = self.make_page("compression")
@@ -1733,6 +1996,12 @@ def launch_gui(initial_project: Path | None = None) -> int:
             self.boot_preview_widget.pack(fill="both", expand=True, padx=20, pady=(0, 20))
             self.boot_preview_widget.configure(state="disabled")
 
+            # Add mouse wheel scrolling for boot preview
+            if self.boot_preview_widget:
+                self.boot_preview_widget.bind("<MouseWheel>", lambda e: self._scroll_widget(self.boot_preview_widget, e))
+                self.boot_preview_widget.bind("<Button-4>", lambda e: self._scroll_widget_down(self.boot_preview_widget))
+                self.boot_preview_widget.bind("<Button-5>", lambda e: self._scroll_widget_up(self.boot_preview_widget))
+
             tk.Label(
                 right,
                 text="Detected metadata files",
@@ -1755,6 +2024,12 @@ def launch_gui(initial_project: Path | None = None) -> int:
             )
             self.metadata_preview_widget.pack(fill="both", expand=True, padx=20, pady=(0, 20))
             self.metadata_preview_widget.configure(state="disabled")
+
+            # Add mouse wheel scrolling for metadata preview
+            if self.metadata_preview_widget:
+                self.metadata_preview_widget.bind("<MouseWheel>", lambda e: self._scroll_widget(self.metadata_preview_widget, e))
+                self.metadata_preview_widget.bind("<Button-4>", lambda e: self._scroll_widget_down(self.metadata_preview_widget))
+                self.metadata_preview_widget.bind("<Button-5>", lambda e: self._scroll_widget_up(self.metadata_preview_widget))
 
         def set_text_widget(self, widget: "scrolledtext.ScrolledText", content: str) -> None:
             widget.configure(state="normal")
@@ -1805,7 +2080,8 @@ def launch_gui(initial_project: Path | None = None) -> int:
         def show_page(self, key: WorkflowStepKey) -> None:
             self.current_page = key
             frame = self.page_frames[key]
-            frame.tkraise()
+            cast_frame: tk.Widget = frame
+            cast_frame.tkraise()  # type: ignore[attr-defined]
             
             # Update nav buttons
             current_idx = next((i for i, (k, _, _) in enumerate(WORKFLOW_STEPS) if k == self.current_page), 0)
@@ -1830,6 +2106,25 @@ def launch_gui(initial_project: Path | None = None) -> int:
             self.log_widget.see("end")
             self.log_widget.configure(state="disabled")
 
+        def _scroll_widget(self, widget: tk.Text | None, event: tk.Event) -> str:
+            """Scroll a text widget on mouse wheel"""
+            if widget:
+                delta = -1 if event.delta > 0 else 1
+                widget.yview_scroll(delta, "units")
+            return "break"
+
+        def _scroll_widget_down(self, widget: tk.Text | None) -> str:
+            """Scroll widget down on Button-4"""
+            if widget:
+                widget.yview_scroll(-1, "units")
+            return "break"
+
+        def _scroll_widget_up(self, widget: tk.Text | None) -> str:
+            """Scroll widget up on Button-5"""
+            if widget:
+                widget.yview_scroll(1, "units")
+            return "break"
+
         def set_busy(self, busy: bool, label: str = "Workflow log") -> None:
             self.busy = busy
             self.log_title_var.set(label)
@@ -1848,7 +2143,8 @@ def launch_gui(initial_project: Path | None = None) -> int:
             return project, project_dir
 
         def describe_compression(self, key: str) -> str:
-            choice = COMPRESSION_CHOICES.get(key, COMPRESSION_CHOICES[DEFAULT_COMPRESSION])
+            default_choice: CompressionChoice = COMPRESSION_CHOICES[DEFAULT_COMPRESSION]
+            choice: CompressionChoice = COMPRESSION_CHOICES.get(cast(CompressionKey, key), default_choice)
             return (
                 f"{choice['title']} selected. {choice['summary']}. "
                 f"{choice['details']}"
@@ -2010,15 +2306,15 @@ def launch_gui(initial_project: Path | None = None) -> int:
                 except Exception as exc:
                     self.queue.put(("log", f"Error reading output: {exc}"))
                 returncode = process.wait()
+                if returncode != 0:
+                    self.queue.put(("log", f"\n❌ Command failed with exit code {returncode}"))
                 self.queue.put(("finished", returncode, label, success_message, on_success))
 
             threading.Thread(target=worker, daemon=True).start()
 
         def process_events(self) -> None:
             try:
-                max_iterations = 100  # Prevent hanging
-                iterations = 0
-                while iterations < max_iterations:
+                while True:
                     event = self.queue.get_nowait()
                     if event[0] == "log":
                         _, line = event
@@ -2096,6 +2392,21 @@ def launch_gui(initial_project: Path | None = None) -> int:
                 cli_args,
                 label="Unpack project",
                 success_message="Project unpacked.",
+                on_success=lambda: self.open_project(project_dir),
+            )
+
+        def handle_unpack_project_force(self) -> None:
+            """Force unpack without prompting"""
+            loaded = self.get_loaded_project()
+            if loaded is None:
+                return
+            _, project_dir = loaded
+
+            cli_args = ["unpack", str(project_dir), "--force"]
+            self.run_cli_task(
+                cli_args,
+                label="Unpack project (force)",
+                success_message="Project unpacked with --force.",
                 on_success=lambda: self.open_project(project_dir),
             )
 
